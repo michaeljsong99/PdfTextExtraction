@@ -1,0 +1,6 @@
+# ignore all pdfs
+*.pdf
+# ignore all xmls
+*.xml
+# ignore all imls
+*.iml
