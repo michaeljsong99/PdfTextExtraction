@@ -5,7 +5,10 @@ import time
 import multiprocessing as mp
 import cv2
 import numpy as np
+import tesserocr as tr
+from PIL import Image
 from ConvertPDF.inserttext import PdfTextInserter
+from ConvertPDF.utils import *
 
 filename = "Resources/smalltest.pdf"
 filename2 = "Resources/test.pdf"
@@ -37,24 +40,17 @@ class PdfParser:
 
         for box in data:
             height = box[0][0][1]
-            page_num = box[2]
-            if page_num not in heights:
-                heights[page_num] = {}
-            if height not in heights[page_num]:
-                heights[page_num][height] = 1
+            if height not in heights:
+                heights[height] = 1
             else:
-                heights[page_num][height] += 1
-            print(page_num, height)
+                heights[height] += 1
 
-        row_heights = {}
-        for page_num in heights.keys():
-            row_heights[page_num] = self.infer_rows_for_single_page(heights[page_num])
+        row_heights = self.infer_rows_for_group(heights)
 
         # Now we iterate through each of the bounding boxes and adjust the starting pixel heights.
         for box in data:
             height = box[0][0][1]
-            page_num = box[2]
-            new_height = row_heights[page_num][height]
+            new_height = row_heights[height]
             # Now we need to move the top-left and bottom-right corners to adjust for the new height.
             if new_height != height:
                 diff = new_height - height
@@ -62,7 +58,7 @@ class PdfParser:
         return data
 
 
-    def infer_rows_for_single_page(self, heights_dict):
+    def infer_rows_for_group(self, heights_dict):
         heights_to_row_heights = {}
         line_buffer = 10 # this represents the number of pixels that we will use to determine rows.
         # i.e. if we have boxes with heights 89, 90, 91, 102 - we infer that the box on height 102
@@ -88,23 +84,64 @@ class PdfParser:
         return heights_to_row_heights
 
 
+    # Get all the text blocks on a page.
+    # This is necessary for two reasons:
+    # 1. We can find the background color and text color for the entire text block at once.
+    # 2. Sometimes, pytesseract bounding boxes can be a bit off.
+    #   Pytesseract does a good job with reading words, however, which is why we use it.
+    #   On the other hand, tesserocr does a good job with finding bounding boxes, but
+    #   a mediocre job at reading words.
+    #   We will map each word bounding box to a text_line. We can then adjust the heights
+    #       and endpoints of our words' bounding boxes such that they fit inside the textline.
+    def get_text_blocks(self, page, text_line = False):
+        level = tr.RIL.BLOCK
+        if text_line:
+            level = tr.RIL.TEXTLINE
+        api = tr.PyTessBaseAPI()
+        text_block_bounding_boxes = []
+        try:
+            api.SetImage(page)
+            text_blocks = api.GetComponentImages(level, True)
+            text = api.GetUTF8Text()
+            print(text)
+            for (im,box,_,_) in text_blocks:
+                x,y,w,h = int(box['x']), int(box['y']), int(box['w']), int(box['h'])
+                print(x, y, w, h)
+                # Get the top left and bottom right corners.
+                text_block_bounding_boxes.append(((x,y), (x+w,y+h)))
+                # TODO: Also get the background color and text color of each text block.
+        finally:
+            api.End()
+        return text_block_bounding_boxes
 
-    def get_word_bounding_boxes(self, page, page_num):
+    # This method gets the top left and bottom right corner of each word's bounding box
+    # on a given page. It also records the actual word itself.
+    def get_word_bounding_boxes(self, page):
         results = []
         boxes = pytesseract.image_to_data(page)
+        api = tr.PyTessBaseAPI()
+        api.SetImage(page)
+        boxes2 = api.GetComponentImages(tr.RIL.WORD, True)
+        print(len(boxes2))
+        for i, (im, box, _, _) in enumerate(boxes2):
+            # im is a PIL image object
+            # box is a dict with x, y, w and h keys
+            api.SetRectangle(box['x'], box['y'], box['w'], box['h'])
+        words = 0
         for x, b in enumerate(boxes.splitlines()):
             if x != 0:
                 b = b.split()
                 if len(b) == 12:
+                    words += 1
                     x, y, w, h, word = int(b[6]), int(b[7]), int(b[8]), int(b[9]), b[11]
                     top_left_corner = (x, y)
                     bottom_right_corner = (w + x, h + y)
-                    page = np.array(page)
-                    # print(word)
-                    results.append([(top_left_corner, bottom_right_corner), word, page_num])
+                    # page = np.array(page)
+                    results.append([(top_left_corner, bottom_right_corner), word])
         return results
 
-
+    # This method is the wrapper, which gets all the bounding boxes in the pdf, and inserts
+    # real text in place of the 'image' of text.
     def pdf_to_bounding_boxes(self):
         results = []
         width = None
@@ -112,16 +149,29 @@ class PdfParser:
         with tempfile.TemporaryDirectory() as path:
             images_from_path = convert_from_path(self.pdf, output_folder=path, first_page=0, last_page=2)
             page_num = 0
+            all_text_blocks = []
             for image in images_from_path:
                 if width is None:
                     width = image.width
                     height = image.height
-                page_bounding_boxes = self.get_word_bounding_boxes(image, page_num)
-                results.extend(page_bounding_boxes)
+                text_blocks = self.get_text_blocks(image)
+                text_lines = self.get_text_blocks(image, text_line=True)
+                page_bounding_boxes = self.get_word_bounding_boxes(image)
+                # Clean up the bounding boxes by matching it to a text line.
+                page_bounding_boxes = adjust_word_bounding_boxes(page_bounding_boxes, text_lines)
+                # For each of the words, assign it to a text block.
+                # Also if a word is not in a text block, adjust it so that it fits inside.
+                text_block_assignments = \
+                    assign_word_bounding_boxes_to_text_blocks(page_bounding_boxes, text_blocks)
+                for block in text_blocks:
+                    # Align the words vertically.
+                    adjusted_height_boxes = self.infer_rows(data=text_block_assignments[block])
+                    for box in adjusted_height_boxes:
+                        results.append((box[0], box[1], page_num))
+                    all_text_blocks.append((block, page_num))
                 page_num += 1
-        results = self.infer_rows(results)
         text_inserter = PdfTextInserter(self.pdf)
-        text_inserter.insert_text(results, (width,height))
+        text_inserter.insert_text(results, (width,height), all_text_blocks)
 
     def ingest_pdf(self):
         # First, convert PDF to images.

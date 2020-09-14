@@ -10,7 +10,7 @@ class PdfTextInserter:
     def __init__(self, file):
         self.pdf = file
 
-    def insert_text(self, text_area_pagenum, dimensions):
+    def insert_text(self, text_area_pagenum, dimensions, text_blocks):
         doc = fitz.open(self.pdf)
         width = dimensions[0]
         height = dimensions[1]
@@ -32,6 +32,14 @@ class PdfTextInserter:
         white = (1, 1, 1)
         save = False
         print("*****************************************************************************************")
+        for block in text_blocks:
+            area = block[0]
+            page_num = block[1]
+            scaled_area = ((area[0][0]/zoom, area[0][1]/zoom), (area[1][0]/zoom, area[1][1]/zoom))
+            rect = fitz.Rect(*scaled_area)
+            page = doc[page_num]
+            # TODO: Later, extract the background color of the text box. For now, everything is just white.
+            page.drawRect(rect, color = white, fill=white)
         for tup in text_area_pagenum:
             area = tup[0]
             scaled_area = ((area[0][0]/zoom, area[0][1]/zoom), (area[1][0]/zoom, area[1][1]/zoom))
@@ -41,8 +49,7 @@ class PdfTextInserter:
             print(scaled_area, text)
             rect = fitz.Rect(*scaled_area)
             page = doc[page_num]
-            page.drawRect(rect, color = white, fill=white)
-            page.insertTextbox(rect, text, fill=purple, align=0, fontsize=12)
+            page.insertTextbox(rect, text, fill=purple, align=0, fontsize=4)
         doc.save("result.pdf")
         print('New pdf saved at "result.pdf')
 
